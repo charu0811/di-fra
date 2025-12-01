@@ -6,3 +6,9 @@ openpyxl
 scikit-learn
 scipy
 statsmodels
+arch
+statsmodels
+sklearn
+pmdarima
+reportlab
+matplotlib
