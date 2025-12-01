@@ -1,306 +1,369 @@
-# streamlit_app_app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import glob, io, zipfile
 from datetime import datetime
-from statsmodels.tsa.stattools import adfuller, acf, pacf
-from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import StandardScaler
 
-st.set_page_config(layout="wide", page_title="OHLC Research Dashboard (robust loader)", initial_sidebar_state="expanded")
+# ---------------------------------------
+# OPTIONAL LIBRARIES
+# ---------------------------------------
+try:
+    from statsmodels.tsa.stattools import adfuller, acf, pacf
+    HAS_STATSMODELS = True
+except:
+    HAS_STATSMODELS = False
 
-# ---------- Data loader ----------
+try:
+    from sklearn.mixture import GaussianMixture
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except:
+    HAS_SKLEARN = False
+
+
+st.set_page_config(layout="wide", page_title="OHLC Research Dashboard")
+
+# ------------------------------------------------------------
+# DATA LOADING (robust)
+# ------------------------------------------------------------
 @st.cache_data
 def try_load_default():
-    """Try to find an Excel/CSV in /mnt/data and return (df, path)."""
-    # Preferred exact file first
     preferred = "/mnt/data/combined_multisheet_fixed_6dp_v2.xlsx"
+
+    # Try preferred file
     try:
         df = pd.read_excel(preferred, sheet_name="Combined", engine="openpyxl")
         return df, preferred
-    except Exception:
+    except:
         pass
 
-    # Try any xlsx/xls in /mnt/data (Combined sheet first, then sheet 0)
-    candidates = sorted(glob.glob("/mnt/data/*.xlsx")) + sorted(glob.glob("/mnt/data/*.xls"))
+    # Try all Excel files
+    candidates = glob.glob("/mnt/data/*.xlsx") + glob.glob("/mnt/data/*.xls")
     for c in candidates:
         try:
             df = pd.read_excel(c, sheet_name="Combined", engine="openpyxl")
             return df, c
-        except Exception:
+        except:
             try:
                 df = pd.read_excel(c, sheet_name=0, engine="openpyxl")
                 return df, c
-            except Exception:
-                continue
+            except:
+                pass
 
-    # Try CSVs as fallback
-    csvs = sorted(glob.glob("/mnt/data/*.csv"))
-    for c in csvs:
+    # Try CSVs
+    candidates = glob.glob("/mnt/data/*.csv")
+    for c in candidates:
         try:
             df = pd.read_csv(c)
             return df, c
-        except Exception:
-            continue
+        except:
+            pass
 
-    # Nothing found
-    raise FileNotFoundError("No suitable Excel/CSV file found in /mnt/data. Use the uploader in the sidebar.")
+    raise FileNotFoundError("No usable Excel or CSV found in /mnt/data.")
 
-def load_from_uploaded(uploaded):
-    """Load a user uploaded file (BytesIO)."""
-    # try Excel first
+
+def load_uploaded(uploaded):
     try:
-        return pd.read_excel(uploaded, sheet_name="Combined", engine="openpyxl")
-    except Exception:
-        pass
+        return pd.read_excel(uploaded, sheet_name="Combined")
+    except:
+        try:
+            return pd.read_excel(uploaded, sheet_name=0)
+        except:
+            uploaded.seek(0)
+            return pd.read_csv(uploaded)
+
+
+# ------------------------------------------------------------
+# SAFE NUMERIC PRICE HANDLER
+# ------------------------------------------------------------
+def get_price_series(df, col_choice):
+    ser_num = pd.to_numeric(df[col_choice], errors="coerce")
+
+    # If numeric data exists
+    if ser_num.dropna().size > 0:
+        if ser_num.isna().any():
+            st.warning(f"Column '{col_choice}' has non-numeric rows. They will be ignored.")
+        return ser_num
+
+    # Column might be date or text
     try:
-        return pd.read_excel(uploaded, sheet_name=0, engine="openpyxl")
-    except Exception:
+        parsed = pd.to_datetime(df[col_choice], errors="coerce")
+        if parsed.notna().sum() > 0:
+            # If close exists, fall back to close
+            if "close" in df.columns:
+                st.info(f"Column '{col_choice}' looks like a date. Using 'close' instead.")
+                return pd.to_numeric(df["close"], errors="coerce")
+            else:
+                st.error(f"Column '{col_choice}' is not numeric. Please pick numeric column.")
+                st.stop()
+    except:
         pass
-    # try CSV
-    uploaded.seek(0)
-    return pd.read_csv(uploaded)
 
-# ---------- Small helpers / indicators ----------
-def sma(series, window): return series.rolling(window=window, min_periods=1).mean()
-def ema(series, span): return series.ewm(span=span, adjust=False).mean()
+    # Try finding numeric-like fallback
+    numeric_candidates = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").dropna().size > 0]
 
-def rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1*delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = ma_up/ma_down
-    return 100 - (100/(1+rs))
+    if numeric_candidates:
+        fallback = numeric_candidates[0]
+        st.warning(f"Column '{col_choice}' is invalid. Falling back to '{fallback}'.")
+        return pd.to_numeric(df[fallback], errors="coerce")
 
-def macd(series, fast=12, slow=26, signal=9):
-    fast_ema = ema(series, fast); slow_ema = ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+    st.error("No numeric-like columns found.")
+    st.stop()
 
-def true_range(df, high_col, low_col, close_col):
-    prev_close = df[close_col].shift(1)
-    tr1 = df[high_col] - df[low_col]
-    tr2 = (df[high_col] - prev_close).abs()
-    tr3 = (df[low_col] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
 
-def atr(df, high_col, low_col, close_col, period=14):
-    tr = true_range(df, high_col, low_col, close_col)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-def hurst_exponent(ts, min_window=10, max_window=None):
-    import numpy as _np, scipy.stats as stats
-    x = _np.array(ts.dropna().astype(float))
-    n = x.size
-    if n < min_window:
-        return np.nan
-    if max_window is None:
-        max_window = n // 2
-    sizes = _np.floor(_np.logspace(np.log10(min_window), np.log10(max_window), num=20)).astype(int)
-    sizes = _np.unique(sizes[sizes>1])
-    rs = []
-    for s in sizes:
-        if s >= n: break
-        num_segments = n // s
-        seg_rs = []
-        for i in range(num_segments):
-            seg = x[i*s:(i+1)*s]
-            if seg.size < 2: continue
-            Z = seg - seg.mean()
-            Y = _np.cumsum(Z)
-            R = Y.max() - Y.min()
-            S = seg.std(ddof=1)
-            if S > 0:
-                seg_rs.append(R/S)
-        if len(seg_rs)>0:
-            rs.append(_np.mean(seg_rs))
-    if len(rs) < 2:
-        return np.nan
-    slope, _, _, _, _ = stats.linregress(_np.log(sizes[:len(rs)]), _np.log(rs))
-    return slope
-
+# ------------------------------------------------------------
+# OPTIONAL METRICS
+# ------------------------------------------------------------
 def adf_test(series):
-    ser = series.dropna().astype(float)
-    if ser.size < 10:
-        return None
-    res = adfuller(ser, autolag='AIC')
-    return {'adf_stat': res[0], 'p_value': res[1], 'used_lag': res[2], 'nobs': res[3], 'crit_vals': res[4]}
+    if not HAS_STATSMODELS:
+        return "statsmodels not installed"
+    series = series.dropna()
+    if len(series) < 10:
+        return "Not enough data"
+    result = adfuller(series)
+    return {
+        "adf_stat": result[0],
+        "p_value": result[1],
+        "used_lags": result[2],
+        "n_obs": result[3],
+        "critical_values": result[4]
+    }
 
-def plot_acf_pacf(series, nlags=40):
-    ser = series.dropna().astype(float)
-    acfs = acf(ser, nlags=nlags, fft=True)
-    pacfs = pacf(ser, nlags=nlags, method='ld')
-    fig_acf = go.Figure(); fig_acf.add_trace(go.Bar(x=list(range(len(acfs))), y=acfs)); fig_acf.update_layout(title='ACF', xaxis_title='lag', yaxis_title='acf')
-    fig_pacf = go.Figure(); fig_pacf.add_trace(go.Bar(x=list(range(len(pacfs))), y=pacfs)); fig_pacf.update_layout(title='PACF', xaxis_title='lag', yaxis_title='pacf')
-    return fig_acf, fig_pacf
 
-def regime_clustering(df, price_col='close', window=20, n_clusters=2):
+def plot_acf_pacf(series):
+    if not HAS_STATSMODELS:
+        fig1 = go.Figure(); fig1.update_layout(title="ACF (statsmodels missing)")
+        fig2 = go.Figure(); fig2.update_layout(title="PACF (statsmodels missing)")
+        return fig1, fig2
+
+    s = series.dropna()
+    acf_vals = acf(s, nlags=40)
+    pacf_vals = pacf(s, nlags=40)
+
+    fig1 = go.Figure()
+    fig1.add_trace(go.Bar(x=list(range(len(acf_vals))), y=acf_vals))
+    fig1.update_layout(title="ACF")
+
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(x=list(range(len(pacf_vals))), y=pacf_vals))
+    fig2.update_layout(title="PACF")
+
+    return fig1, fig2
+
+
+def hurst_exponent(series):
+    import numpy as np
+    import scipy.stats as stats
+
+    ts = np.array(series.dropna())
+    N = len(ts)
+    if N < 50: return np.nan
+
+    lags = np.arange(2, 20)
+    tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0]
+
+
+def regime_clustering(df, price_col="close", window=20):
+    if not HAS_SKLEARN:
+        return pd.Series(index=df.index, dtype=float), pd.DataFrame()
+
     ret = df[price_col].pct_change().fillna(0)
-    roll_mean = ret.rolling(window=window).mean().fillna(0)
-    roll_vol = ret.rolling(window=window).std().fillna(0)
-    features = pd.DataFrame({'ret_mean': roll_mean, 'ret_vol': roll_vol}, index=df.index).dropna()
-    scaler = StandardScaler(); X = scaler.fit_transform(features)
-    gmm = GaussianMixture(n_components=n_clusters, random_state=0)
-    labels = gmm.fit_predict(X)
-    regimes = pd.Series(index=features.index, data=labels)
-    return regimes, features
+    roll_mean = ret.rolling(window).mean().fillna(0)
+    roll_vol = ret.rolling(window).std().fillna(0)
 
-# ---------- CoV & report ----------
-def compute_cov_and_corr(df):
-    d = df.copy()
-    d.columns = [c.strip().lower().replace(' ', '_') for c in d.columns]
-    date_col = None
-    for c in d.columns:
-        if any(k in c for k in ('date','time','timestamp')):
-            date_col = c; break
-    for c in ['open','high','low','close']:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors='coerce')
-    if 'close' not in d.columns:
-        raise ValueError("No 'close' column present.")
-    if date_col:
-        d[date_col] = pd.to_datetime(d[date_col], errors='coerce')
-        d = d.sort_values(by=date_col).reset_index(drop=True)
-    d = d.dropna(subset=['close']).copy()
-    d['return'] = d['close'].pct_change()
-    ret = d['return'].dropna()
-    mean_ret = ret.mean(); std_ret = ret.std(ddof=1)
-    cov_ret = std_ret / (abs(mean_ret) if mean_ret != 0 else np.nan)
-    cov_per_instrument = None
-    if 'source_file' in d.columns:
-        rows = []
-        for name,g in d.groupby('source_file'):
-            r = g['close'].pct_change().dropna()
-            if r.size>0:
-                rows.append({'source_file': name, 'mean_return': r.mean(), 'std_return': r.std(ddof=1),
-                             'cov': r.std(ddof=1)/(abs(r.mean()) if r.mean()!=0 else np.nan), 'n': int(r.size)})
-        cov_per_instrument = pd.DataFrame(rows)
-    ohlc_cols = [c for c in ['open','high','low','close'] if c in d.columns]
-    corr_matrix = d[ohlc_cols].corr() if len(ohlc_cols) else None
-    summary = {'mean_return': mean_ret, 'std_return': std_ret, 'coefficient_of_variation_return': cov_ret, 'n_returns': int(ret.size)}
-    return summary, corr_matrix, cov_per_instrument
+    X = pd.DataFrame({"mean": roll_mean, "vol": roll_vol}).dropna()
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-def make_report_zip(summary, corr_df, cov_per_instrument):
+    gmm = GaussianMixture(n_components=2)
+    labels = gmm.fit_predict(X_scaled)
+
+    regimes = pd.Series(index=X.index, data=labels)
+    return regimes, X
+
+
+# ------------------------------------------------------------
+# Coefficient of Variation Report
+# ------------------------------------------------------------
+def compute_cov(df):
+    df = df.copy()
+
+    df["ret"] = df["close"].pct_change()
+    ret = df["ret"].dropna()
+
+    summary = {
+        "mean_return": ret.mean(),
+        "std_return": ret.std(),
+        "cov": ret.std() / abs(ret.mean()) if ret.mean() != 0 else np.nan
+    }
+
+    corr = df[["open", "high", "low", "close"]].corr()
+
+    per_inst = None
+    if "source_file" in df.columns:
+        groups = []
+        for name, g in df.groupby("source_file"):
+            r = g["close"].pct_change().dropna()
+            if len(r) > 0:
+                groups.append({
+                    "instrument": name,
+                    "mean": r.mean(),
+                    "std": r.std(),
+                    "cov": r.std() / abs(r.mean()) if r.mean() != 0 else np.nan
+                })
+        per_inst = pd.DataFrame(groups)
+
+    return summary, corr, per_inst
+
+
+def zip_report(summary, corr, per_inst):
     mem = io.BytesIO()
-    with zipfile.ZipFile(mem, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('cofr_summary.csv', pd.DataFrame(list(summary.items()), columns=['metric','value']).to_csv(index=False))
-        if corr_df is not None:
-            zf.writestr('ohlc_correlation.csv', corr_df.to_csv(index=True))
-        if cov_per_instrument is not None:
-            zf.writestr('cov_per_instrument.csv', cov_per_instrument.to_csv(index=False))
-        zf.writestr('README.txt', "CoV report: CoV = std(return)/|mean(return)|. Returns computed as close.pct_change().")
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("summary.csv", pd.DataFrame([summary]).to_csv(index=False))
+        z.writestr("correlation.csv", corr.to_csv())
+        if per_inst is not None:
+            z.writestr("cov_per_instrument.csv", per_inst.to_csv(index=False))
+        z.writestr("README.txt", "CoV Report generated by Streamlit")
+
     mem.seek(0)
     return mem
 
-# ---------- App UI and logic ----------
-st.title("OHLC Research Dashboard - Robust")
 
-# attempt to load default dataset; if not found show uploader
-data_df = None; data_path = None
+# ------------------------------------------------------------
+# UI START
+# ------------------------------------------------------------
+st.title("OHLC Research Dashboard — Updated Version")
+
+# Load data
 try:
-    data_df, data_path = try_load_default()
-    st.sidebar.success(f"Loaded data from: {data_path}")
-except FileNotFoundError as e:
-    st.sidebar.warning(str(e))
-    uploaded = st.sidebar.file_uploader("Upload cleaned combined Excel (.xlsx/.xls) or CSV", type=['xlsx','xls','csv'])
-    if uploaded is None:
-        st.info("No data available. Please upload the cleaned Excel/CSV in the sidebar or place it in /mnt/data.")
-        st.stop()
-    try:
-        data_df = load_from_uploaded(uploaded)
-        st.sidebar.success(f"Loaded uploaded file: {uploaded.name}")
-    except Exception as ex:
-        st.sidebar.error(f"Failed to parse uploaded file: {ex}")
+    df, path = try_load_default()
+    st.sidebar.success(f"Loaded dataset: {path}")
+except:
+    uploaded = st.sidebar.file_uploader("Upload Excel/CSV")
+    if uploaded:
+        df = load_uploaded(uploaded)
+        st.sidebar.success(f"Loaded {uploaded.name}")
+    else:
         st.stop()
 
-# normalize df
-df = data_df.copy()
-df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
+# Normalize
+df.columns = [c.lower().replace(" ", "_") for c in df.columns]
 
-# find date column
+# Date column
 date_col = None
 for c in df.columns:
-    if any(k in c for k in ('date','time','timestamp')):
-        date_col = c; break
+    if any(x in c for x in ["date", "time"]):
+        date_col = c
+        break
+
 if date_col is None:
-    st.error("No date-like column found (headers containing 'date'/'time'/'timestamp').")
+    st.error("No date column found.")
     st.stop()
 
-df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-df = df.dropna(subset=[date_col]).sort_values(by=date_col).reset_index(drop=True)
+df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+df = df.dropna(subset=[date_col])
 
-# controls
-instruments = sorted(df['source_file'].unique()) if 'source_file' in df.columns else ["All"]
-selected_instrument = st.sidebar.selectbox("Instrument", ["All"] + instruments)
-value_column = st.sidebar.selectbox("Price column", [c for c in df.columns if c in ["open","high","low","close"]])
-start_date = st.sidebar.date_input("Start date", df[date_col].min().date())
-end_date = st.sidebar.date_input("End date", df[date_col].max().date())
+# Sidebar options
+instruments = ["All"] + sorted(df["source_file"].unique()) if "source_file" in df.columns else ["All"]
+instrument = st.sidebar.selectbox("Instrument", instruments)
 
-# filter
+value_col = st.sidebar.selectbox("Price Column", ["open", "high", "low", "close"])
+start = st.sidebar.date_input("Start", df[date_col].min())
+end = st.sidebar.date_input("End", df[date_col].max())
+
+# Filtering
 data = df.copy()
-if selected_instrument != "All":
-    data = data[data['source_file'] == selected_instrument]
-data = data.set_index(date_col)
-data = data.loc[start_date:end_date].reset_index()
+if instrument != "All":
+    data = data[data["source_file"] == instrument]
 
-price = data[value_column].astype(float)
-data['ret'] = price.pct_change(); data['logret'] = np.log(price).diff()
+data = data[(data[date_col] >= pd.Timestamp(start)) & (data[date_col] <= pd.Timestamp(end))]
 
-# advanced metrics
-adf_price = adf_test(price); adf_returns = adf_test(data['ret'])
-fig_acf, fig_pacf = plot_acf_pacf(price, nlags=40)
-hurst = hurst_exponent(price, min_window=10)
-regimes, features = regime_clustering(data, price_col=value_column, window=20, n_clusters=2)
-data = data.join(regimes.rename('regime'), how='left')
+# SAFE PRICE
+price = get_price_series(data, value_col)
 
-# KPIs & charts
+# ------------------------------------------------------------
+# ADVANCED METRICS
+# ------------------------------------------------------------
+data["ret"] = price.pct_change()
+data["logret"] = np.log(price).diff()
+
+adf_price = adf_test(price)
+adf_ret = adf_test(data["ret"])
+
+fig_acf, fig_pacf = plot_acf_pacf(price)
+hurst = hurst_exponent(price)
+regimes, feats = regime_clustering(data, price_col=value_col)
+
+# ------------------------------------------------------------
+# KPIs
+# ------------------------------------------------------------
 c1, c2, c3 = st.columns(3)
-c1.metric("Start", str(data[date_col].min()))
-c2.metric("End", str(data[date_col].max()))
-c3.metric(f"Mean {value_column}", f"{price.mean():.6f}")
+c1.metric("Start", str(start))
+c2.metric("End", str(end))
+c3.metric("Mean Price", f"{price.mean():.6f}")
 
+# ------------------------------------------------------------
+# PRICE + REGIMES
+# ------------------------------------------------------------
 fig = go.Figure()
-for r in sorted(data['regime'].dropna().unique()):
-    seg = data[data['regime'] == r]
-    fig.add_trace(go.Scatter(x=seg[date_col], y=seg[value_column], mode='lines', name=f"Regime {int(r)}"))
-fig.update_layout(title=f"{value_column.upper()} segmented by regimes", height=450)
+
+if regimes.notna().sum() > 0:
+    for r in regimes.unique():
+        seg = data.iloc[regimes[regimes == r].index]
+        fig.add_trace(go.Scatter(
+            x=seg[date_col], y=seg[value_col],
+            mode="lines",
+            name=f"Regime {r}"
+        ))
+else:
+    fig.add_trace(go.Scatter(x=data[date_col], y=data[value_col], mode="lines"))
+
 st.plotly_chart(fig, use_container_width=True)
 
+# ADF + ACF/PACF + Hurst
 st.subheader("Stationarity & Autocorrelation")
-st.write("ADF (price):", adf_price)
-st.write("ADF (returns):", adf_returns)
-col_acf, col_pacf = st.columns(2)
-with col_acf: st.plotly_chart(fig_acf, use_container_width=True)
-with col_pacf: st.plotly_chart(fig_pacf, use_container_width=True)
+st.write("ADF (Price):", adf_price)
+st.write("ADF (Returns):", adf_ret)
 
-st.subheader("Hurst exponent")
-st.write(f"Hurst ≈ {hurst:.4f}")
+col1, col2 = st.columns(2)
+col1.plotly_chart(fig_acf, use_container_width=True)
+col2.plotly_chart(fig_pacf, use_container_width=True)
 
-st.subheader("Regime features (rolling mean & vol)")
-st.dataframe(features.join(regimes.rename('regime')).tail(200))
-st.download_button("Download regimes CSV", features.join(regimes.rename('regime')).reset_index().to_csv(index=False), "regimes.csv", "text/csv")
+st.subheader("Hurst Exponent")
+st.write(f"H ≈ {hurst:.4f}")
 
-# CoV report
-st.markdown("---")
-st.header("Generate CoV report (zip)")
+# ------------------------------------------------------------
+# REGIME FEATURES
+# ------------------------------------------------------------
+st.subheader("Regime Features")
+if not feats.empty:
+    st.dataframe(feats.join(regimes.rename("regime")).tail(200))
 
-if st.button("Generate CoV Report ZIP"):
-    try:
-        summary, corr_df, cov_per_instrument = compute_cov_and_corr(data)
-        zipbuf = make_report_zip(summary, corr_df, cov_per_instrument)
-        st.success("Report generated.")
-        st.download_button("Download CoV report (ZIP)", zipbuf, "cofr_report.zip", "application/zip")
-        st.subheader("Summary"); st.table(pd.DataFrame(list(summary.items()), columns=['metric','value']))
-        if corr_df is not None:
-            st.subheader("OHLC correlation matrix"); st.dataframe(corr_df)
-        if cov_per_instrument is not None:
-            st.subheader("CoV per instrument"); st.dataframe(cov_per_instrument)
-    except Exception as e:
-        st.error(f"Failed to create CoV report: {e}")
+# ------------------------------------------------------------
+# CoV REPORT
+# ------------------------------------------------------------
+st.header("Download CoV Report")
+
+if st.button("Generate Report"):
+    summary, corr, per_inst = compute_cov(data)
+    buf = zip_report(summary, corr, per_inst)
+
+    st.download_button(
+        "Download CoV ZIP",
+        buf,
+        "cov_report.zip",
+        mime="application/zip"
+    )
+
+    st.subheader("Summary")
+    st.table(pd.DataFrame([summary]))
+
+    st.subheader("Correlation Matrix")
+    st.dataframe(corr)
+
+    if per_inst is not None:
+        st.subheader("CoV Per Instrument")
+        st.dataframe(per_inst)
