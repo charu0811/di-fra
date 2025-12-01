@@ -347,46 +347,58 @@ else:
     st.line_chart(df_calc[['roll_vol_20']].assign(regime=df_calc['vol_regime'].fillna(-1)))
 
 # Dynamic Range Compression Detector
+# Dynamic Range Compression Detector (robust replacement)
 st.subheader("Dynamic Range Compression Detector (low ATR percentile detection)")
 percentile_thr = st.sidebar.slider("ATR compression percentile threshold", 1, 50, 10)
+
+# Ensure ATR exists
 if 'atr_14' in df_calc.columns and df_calc['atr_14'].notna().any():
+    # Create boolean compression series
     df_calc['compressed'] = dynamic_range_compression(df_calc, atr_col='atr_14', window=14, percentile=percentile_thr)
-    st.write(f"Compression count: {df_calc['compressed'].sum()} points (ATR < {percentile_thr}th pct)")
-    # Show compression periods on price chart
-    comp_idx = df_calc.index[df_calc['compressed']]
+
+    # Count and show
+    comp_count = int(df_calc['compressed'].sum())
+    st.write(f"Compression count: {comp_count} points (ATR < {percentile_thr}th percentile)")
+
+    # Plot price with markers for compression points
+    comp_idx = df_calc.index[df_calc['compressed'].fillna(False)]
     fig_comp = go.Figure()
     fig_comp.add_trace(go.Scatter(x=df_calc.index, y=df_calc[price_col], mode='lines', name='price'))
-    if not comp_idx.empty:
-        fig_comp.add_trace(go.Scatter(x=comp_idx, y=df_calc.loc[comp_idx, price_col], mode='markers', name='compressed', marker=dict(color='red', size=6)))
+    if len(comp_idx) > 0:
+        fig_comp.add_trace(go.Scatter(x=comp_idx, y=df_calc.loc[comp_idx, price_col], mode='markers',
+                                      name='compressed', marker=dict(color='red', size=6)))
     fig_comp.update_layout(height=300)
     st.plotly_chart(fig_comp, use_container_width=True)
-    # show table of compression windows (group contiguous)
-    comp = df_calc['compressed'].astype(int)
-    groups = (comp.diff(1) != 0).cumsum()
-    comp_periods = []
-    in_period = False
-    start_i = None
-    for idx, v in df_calc['compressed'].iteritems():
-        if v and not in_period:
-            in_period = True
-            start_i = idx
-        if not v and in_period:
-            in_period = False
-            end_i = prev_idx
-            comp_periods.append((start_i, end_i))
-        prev_idx = idx
-    # if ended with compression
-    if in_period:
-        comp_periods.append((start_i, prev_idx))
-    if comp_periods:
-        comp_df = pd.DataFrame(comp_periods, columns=['start','end'])
-        st.write("Compression intervals (start - end):")
-        st.dataframe(comp_df)
+
+    # Group contiguous True values into intervals
+    comp_series = df_calc['compressed'].fillna(False).astype(int)
+
+    if comp_series.sum() == 0:
+        st.write("No compression points detected with the current threshold.")
     else:
-        st.write("No continuous compression intervals detected.")
+        # create group ids for contiguous True blocks
+        # groups increments when value changes; we then keep only groups where value == 1
+        grp = (comp_series != comp_series.shift(1)).cumsum()
+        grouped = df_calc[['compressed']].assign(group=grp).loc[comp_series.index]
+        # filter groups where 'compressed' is True
+        true_groups = grouped[grouped['compressed'] == 1].groupby('group')
+
+        comp_periods = []
+        for _, g in true_groups:
+            start_ts = g.index[0]
+            end_ts = g.index[-1]
+            comp_periods.append((start_ts, end_ts, len(g)))
+
+        if comp_periods:
+            comp_df = pd.DataFrame(comp_periods, columns=['start', 'end', 'duration_bars'])
+            st.write("Compression intervals (start - end, duration in bars):")
+            st.dataframe(comp_df)
+        else:
+            st.write("No continuous compression intervals detected.")
 
 else:
     st.info("ATR not computed; compression detector not available.")
+
 
 # Trading-style regime classifier
 st.subheader("Trading-style Regime Classifier (combine vol regime & momentum)")
