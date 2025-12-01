@@ -200,11 +200,35 @@ def generate_pdf_report(summary_text, tables, out_path="/mnt/data/research_repor
 st.title("Research Dashboard — Professional (GARCH, PCA, VAR, Forecasting, Entropy, Transition Matrix)")
 
 # Load data
-try:
-    df = load_combined("/mnt/data/combined_fixed.xlsx")
-except Exception as e:
-    st.error(f"Failed to load combined file: {e}")
-    st.stop()
+# Try automatic load first
+default_path = "/mnt/data/combined_fixed.xlsx"
+
+df = None
+if Path(default_path).exists():
+    try:
+        df = pd.read_excel(default_path, engine="openpyxl")
+        st.sidebar.success("Loaded combined_fixed.xlsx from /mnt/data")
+    except Exception as e:
+        st.sidebar.warning(f"Could not load default file: {e}")
+
+# If no auto-load, show uploader
+if df is None:
+    st.sidebar.warning("No combined_fixed.xlsx found. Please upload your dataset.")
+    uploaded = st.sidebar.file_uploader("Upload combined_fixed.xlsx or any CSV/Excel", type=["xlsx","xls","csv"])
+    
+    if uploaded is not None:
+        try:
+            if uploaded.name.endswith(".csv"):
+                df = pd.read_csv(uploaded)
+            else:
+                df = pd.read_excel(uploaded, engine="openpyxl")
+            st.sidebar.success(f"Loaded: {uploaded.name}")
+        except Exception as e:
+            st.error(f"Failed to read uploaded file: {e}")
+            st.stop()
+    else:
+        st.stop()
+
 
 # normalize cols
 df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
