@@ -1,15 +1,22 @@
-# streamlit_app_full_professional.py
+# streamlit_app_full_with_range.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import glob, io, zipfile, os
+import plotly.express as px
 from pathlib import Path
-from datetime import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
+import glob, io, zipfile, os
+from datetime import datetime, timedelta
 
-# --- PROFESSIONAL LIBRARIES (expected installed) ---
+# Optional libraries
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.cluster import KMeans
+    from sklearn.mixture import GaussianMixture
+    HAS_SKLEARN = True
+except Exception:
+    HAS_SKLEARN = False
+
 try:
     from arch import arch_model
     HAS_ARCH = True
@@ -17,459 +24,407 @@ except Exception:
     HAS_ARCH = False
 
 try:
-    from sklearn.decomposition import PCA
-    from sklearn.cluster import KMeans
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.mixture import GaussianMixture
-    from sklearn.cluster import KMeans
-    HAS_SKLEARN = True
-except Exception:
-    HAS_SKLEARN = False
-
-try:
     import statsmodels.api as sm
-    from statsmodels.tsa.api import VAR
-    from statsmodels.tsa.vector_ar.vecm import coint_johansen, VECM
     from statsmodels.tsa.stattools import adfuller, acf, pacf
-    HAS_STATSMODELS = True
+    HAS_STATSM = True
 except Exception:
-    HAS_STATSMODELS = False
+    HAS_STATSM = False
 
-try:
-    import pmdarima as pm
-    HAS_PMDARIMA = True
-except Exception:
-    HAS_PMDARIMA = False
+# Page config
+st.set_page_config(layout="wide", page_title="Advanced Volatility & Range Dashboard")
 
-from scipy.stats import entropy as shannon_entropy
-# reportlab imports (for PDF)
-try:
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table as RLTable
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib.pagesizes import letter
-    HAS_REPORTLAB = True
-except Exception:
-    HAS_REPORTLAB = False
-
-st.set_page_config(layout="wide", page_title="Research Dashboard — Professional")
-
-# ---------------------------
-# Utilities
-# ---------------------------
-def load_combined(path="/mnt/data/combined_fixed.xlsx"):
-    if Path(path).exists():
-        df = pd.read_excel(path, engine="openpyxl")
-        return df
-    # fallback: try to combine CSVs
+# -----------------------
+# Utility functions
+# -----------------------
+def load_default_combined(path="/mnt/data/combined_fixed.xlsx"):
+    p = Path(path)
+    if p.exists():
+        try:
+            df = pd.read_excel(p, engine="openpyxl")
+            return df
+        except Exception as e:
+            st.warning(f"Could not read default combined file: {e}")
+    # fallback: try CSV combine
     csvs = sorted(glob.glob("/mnt/data/*.csv"))
-    if csvs:
-        frames = []
-        for f in csvs:
-            df = pd.read_csv(f)
-            df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
-            date_col = next((c for c in df.columns if 'date' in c or 'time' in c), None)
+    frames = []
+    for f in csvs:
+        try:
+            tmp = pd.read_csv(f)
+            tmp.columns = [c.strip().lower().replace(' ', '_') for c in tmp.columns]
+            date_col = next((c for c in tmp.columns if 'date' in c or 'time' in c), None)
             if date_col:
-                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-            df['source_file'] = Path(f).stem
-            frames.append(df)
+                tmp[date_col] = pd.to_datetime(tmp[date_col], errors='coerce')
+            tmp['source_file'] = Path(f).stem
+            frames.append(tmp)
+        except Exception:
+            continue
+    if frames:
         comb = pd.concat(frames, ignore_index=True, sort=False)
         date_col = next((c for c in comb.columns if 'date' in c or 'time' in c), None)
         if date_col:
-            comb = comb.dropna(subset=[date_col])
-            comb = comb.sort_values(by=date_col).reset_index(drop=True)
+            comb = comb.dropna(subset=[date_col]).sort_values(by=date_col).reset_index(drop=True)
         return comb
-    raise FileNotFoundError("No combined_fixed.xlsx or CSVs found in /mnt/data")
+    return None
 
-def ensure_price_col(df, col):
-    """Return a numeric Series for the price column, or stop with an error."""
-    if col not in df.columns:
-        st.error(f"Column {col} not found.")
+def ensure_datetime_index(df):
+    df = df.copy()
+    date_col = next((c for c in df.columns if 'date' in c or 'time' in c), None)
+    if date_col is None:
+        st.error("No date/time column detected in the dataset.")
         st.stop()
-    ser = pd.to_numeric(df[col], errors='coerce')
-    if ser.dropna().empty:
-        st.error(f"Column {col} has no numeric values.")
-        st.stop()
-    return ser
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df = df.dropna(subset=[date_col]).sort_values(by=date_col).reset_index(drop=True)
+    df.set_index(date_col, inplace=True)
+    return df
 
-def compute_shannon_entropy(returns, bins=50):
-    r = returns.dropna()
-    if r.empty:
-        return np.nan
-    hist, edges = np.histogram(r, bins=bins, density=True)
-    hist = hist[hist>0]
-    if hist.size == 0:
-        return 0.0
-    return shannon_entropy(hist)
+def safe_numeric(series):
+    return pd.to_numeric(series, errors='coerce')
 
-def compute_returns(series):
-    return series.pct_change().dropna()
+# ATR calculation (True Range & ATR)
+def compute_true_range(df, high_col='high', low_col='low', close_col='close'):
+    h = safe_numeric(df[high_col])
+    l = safe_numeric(df[low_col])
+    c = safe_numeric(df[close_col])
+    prev_c = c.shift(1)
+    tr1 = h - l
+    tr2 = (h - prev_c).abs()
+    tr3 = (l - prev_c).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr
 
-# ---------------------------
-# SAFE ADF function (fixes NameError + constant-series error)
-# ---------------------------
-def adf_test(series):
-    """
-    Safe wrapper for augmented dickey-fuller test.
-    Returns a dict with results, or a human-readable string if not applicable.
-    """
-    if not HAS_STATSMODELS:
-        return "statsmodels not installed"
+def compute_atr(df, window=14, high_col='high', low_col='low', close_col='close'):
+    tr = compute_true_range(df, high_col, low_col, close_col)
+    atr = tr.rolling(window=window, min_periods=1).mean()
+    return atr
 
-    ser = pd.to_numeric(series, errors='coerce').dropna()
-    if ser.size < 10:
-        return "Not enough data for ADF (min 10 non-null samples)"
-    if ser.nunique() <= 1:
-        return "ADF not applicable: series is constant"
+# Rolling volatility (std of returns)
+def rolling_volatility(series, window=20):
+    return series.pct_change().rolling(window=window).std()
 
-    try:
-        res = adfuller(ser, autolag='AIC')
-        return {
-            'adf_stat': res[0],
-            'p_value': res[1],
-            'used_lag': res[2],
-            'nobs': res[3],
-            'critical_values': res[4]
-        }
-    except ValueError as e:
-        return f"ADF ValueError: {e}"
-    except Exception as e:
-        return f"ADF error: {e}"
+# Volatility heatmap: pivot time vs instrument or time-of-day vs date
+def volatility_heatmap_dataframe(df, price_col='close', window=20, freq='D'):
+    # Resample returns volatility at frequency freq and compute daily/hourly vol depending on freq
+    series = safe_numeric(df[price_col]).pct_change()
+    # create period column
+    period_index = series.resample(freq).apply(lambda x: x.rolling(window).std().mean())
+    # period_index is Series with DatetimeIndex
+    return period_index
 
-# ---------------------------
-# Analytics modules
-# ---------------------------
-def run_garch(returns, p=1, q=1):
-    if not HAS_ARCH:
-        return None, "arch not installed"
-    r = (returns - returns.mean()) * 100  # scale to percent for arch
-    am = arch_model(r, vol='Garch', p=p, q=q, mean='Zero', dist='normal')
-    res = am.fit(disp='off')
-    cond_vol = res.conditional_volatility / 100.0
-    return cond_vol, res
-
-def run_pca_on_returns(df, cols, n_components=3):
-    if not HAS_SKLEARN:
-        return None, "sklearn not installed"
-    X = df[cols].pct_change().dropna().fillna(0)
+# Range clustering
+def range_clustering(df, price_cols=('open','high','low','close'), rolling_window=20, n_clusters=3):
+    # features: rolling range, rolling ATR, rolling vol
+    dfc = df.copy()
+    # ensure OHLC exist
+    for c in price_cols:
+        if c not in dfc.columns:
+            dfc[c] = np.nan
+    dfc['range'] = safe_numeric(dfc['high']) - safe_numeric(dfc['low'])
+    dfc['atr_14'] = compute_atr(dfc, window=14)
+    dfc['roll_vol_20'] = rolling_volatility(dfc['close'], window=20)
+    feat = dfc[['range','atr_14','roll_vol_20']].dropna()
+    if feat.empty or not HAS_SKLEARN:
+        return None, feat
     scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-    pca = PCA(n_components=n_components)
-    pcs = pca.fit_transform(Xs)
-    return {'pca': pca, 'components': pcs, 'explained_variance': pca.explained_variance_ratio_, 'index': X.index}
-
-def pca_volatility_clusters(df, price_col, n_clusters=3):
-    if not HAS_SKLEARN:
-        return None, "sklearn not installed"
-    ret = df[price_col].pct_change().fillna(0)
-    feat = pd.DataFrame({
-        'v_short': ret.rolling(10).std().fillna(0),
-        'v_long': ret.rolling(60).std().fillna(0)
-    }).dropna()
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(feat)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(Xs)
+    X = scaler.fit_transform(feat)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(X)
     labels = pd.Series(kmeans.labels_, index=feat.index)
     return labels, feat
 
-def regime_transition_matrix(regimes_series):
-    r = regimes_series.dropna().astype(int)
-    if r.empty:
-        return None
-    prev = r.shift(1).dropna()
-    curr = r.loc[prev.index]
-    mat = pd.crosstab(prev, curr, normalize='index')
-    return mat
-
-def var_fit_and_forecast(df, cols, steps=5):
-    if not HAS_STATSMODELS:
-        return None, "statsmodels not installed"
-    data = df[cols].pct_change().dropna()
-    if data.shape[0] < 10:
-        return None, "Not enough data for VAR"
-    model = VAR(data)
-    sel = model.select_order(15)
-    lag = sel.selected_orders.get('aic', 1) if hasattr(sel, "selected_orders") else 1
-    res = model.fit(lag)
-    fc = res.forecast(data.values[-res.k_ar:], steps=steps)
-    # create forecast index by extending the datetime index by frequency if present
+# Volatility Regime Classifier (GMM/KMeans on rolling vol + returns)
+def volatility_regime_classifier(df, price_col='close', vol_window=20, n_regimes=2):
+    s = safe_numeric(df[price_col]).pct_change().fillna(0)
+    feat = pd.DataFrame({
+        'roll_vol': s.rolling(vol_window).std().fillna(0),
+        'ret': s
+    }).dropna()
+    if feat.empty or not HAS_SKLEARN:
+        return None, feat
+    scaler = StandardScaler()
+    X = scaler.fit_transform(feat)
     try:
-        last = data.index[-1]
-        freq = pd.infer_freq(data.index)
-        if freq is not None:
-            idx = pd.date_range(start=last, periods=steps+1, freq=freq)[1:]
-        else:
-            idx = pd.RangeIndex(start=len(data), stop=len(data)+steps)
+        gmm = GaussianMixture(n_components=n_regimes, random_state=0).fit(X)
+        labels = gmm.predict(X)
     except Exception:
-        idx = pd.RangeIndex(start=len(data), stop=len(data)+steps)
-    fc_df = pd.DataFrame(fc, index=idx, columns=data.columns)
-    return fc_df, res
+        km = KMeans(n_clusters=n_regimes, random_state=0).fit(X)
+        labels = km.labels_
+    regimes = pd.Series(labels, index=feat.index)
+    # compute transition matrix
+    trans = pd.crosstab(regimes.shift(1).dropna(), regimes.loc[regimes.shift(1).dropna().index], normalize='index')
+    return regimes, feat, trans
 
-def auto_arima_forecast(series, steps=10):
-    if not HAS_PMDARIMA:
-        return None, "pmdarima not installed"
-    s = series.dropna()
-    if len(s) < 20:
-        return None, "Not enough data for auto_arima"
-    model = pm.auto_arima(s, seasonal=False, stepwise=True, suppress_warnings=True)
-    fc = model.predict(n_periods=steps)
-    idx = pd.RangeIndex(start=len(s), stop=len(s)+steps)
-    return pd.Series(fc, index=idx), model
+# Dynamic Range Compression Detector (low ATR percentile -> flag)
+def dynamic_range_compression(df, atr_col='atr_14', window=14, percentile=10):
+    atr = df[atr_col].dropna()
+    if atr.empty:
+        return pd.Series(index=df.index, data=False)
+    # compute rolling percentile threshold
+    thr = np.nanpercentile(atr.dropna(), percentile)
+    # where ATR below threshold => compression
+    comp = atr < thr
+    # return boolean series aligned to df (fill missing with False)
+    comp_full = pd.Series(False, index=df.index)
+    comp_full.loc[atr.index] = comp
+    return comp_full
 
-# ---------------------------
-# PDF Report (optional)
-# ---------------------------
-def generate_pdf_report(summary_text, tables, out_path="/mnt/data/research_report_professional.pdf"):
-    if not HAS_REPORTLAB:
-        raise RuntimeError("reportlab not installed")
-    styles = getSampleStyleSheet()
-    doc = SimpleDocTemplate(out_path, pagesize=letter)
-    story = []
-    story.append(Paragraph("Research Dashboard Report", styles['Title']))
-    story.append(Spacer(1, 12))
-    story.append(Paragraph(summary_text, styles['Normal']))
-    story.append(Spacer(1, 12))
-    for name, df in tables.items():
-        story.append(Paragraph(name, styles['Heading3']))
-        data = [df.columns.tolist()] + df.head(20).values.tolist()
-        story.append(RLTable(data))
-        story.append(Spacer(1, 12))
-    doc.build(story)
-    return out_path
+# Trading-style regime classifier: combine vol regime + momentum (sign of rolling mean returns)
+def trading_regime_classifier(df, price_col='close', vol_regimes=None, momentum_window=5):
+    dfc = df.copy()
+    dfc['ret'] = safe_numeric(dfc[price_col]).pct_change()
+    dfc['mom'] = dfc['ret'].rolling(momentum_window).mean()
+    mom_sign = dfc['mom'].apply(lambda x: 1 if x>0 else (-1 if x<0 else 0))
+    # Combine: regime*10 + mom_sign to create interpretable classes
+    if vol_regimes is None:
+        combined = mom_sign.fillna(0)
+        return combined, dfc
+    combined = pd.Series(0, index=dfc.index)
+    combined.loc[vol_regimes.index] = vol_regimes * 10 + mom_sign.loc[vol_regimes.index].fillna(0).astype(int)
+    return combined, dfc
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.title("Research Dashboard — Professional (fixed ADF)")
+# -----------------------
+# UI and main flow
+# -----------------------
+st.title("Volatility & Range Analysis Dashboard — Advanced Features")
 
-# Load file (auto load from /mnt/data or show uploader)
-df = None
-default_path = "/mnt/data/combined_fixed.xlsx"
-if Path(default_path).exists():
-    try:
-        df = pd.read_excel(default_path, engine="openpyxl")
-        st.sidebar.success("Loaded combined_fixed.xlsx from /mnt/data")
-    except Exception as e:
-        st.sidebar.warning(f"Failed to load default combined file: {e}")
-
+# Load data (auto or upload)
+df = load_default_combined("/mnt/data/combined_fixed.xlsx")
 if df is None:
-    uploaded = st.sidebar.file_uploader("Upload combined_fixed.xlsx or CSV", type=["xlsx","xls","csv"])
-    if uploaded is not None:
+    uploaded = st.sidebar.file_uploader("Upload combined_fixed.xlsx or CSV", type=['xlsx','xls','csv'])
+    if uploaded:
         try:
-            if uploaded.name.lower().endswith(".csv"):
+            if uploaded.name.lower().endswith('.csv'):
                 df = pd.read_csv(uploaded)
             else:
                 df = pd.read_excel(uploaded, engine="openpyxl")
             st.sidebar.success(f"Loaded {uploaded.name}")
         except Exception as e:
-            st.error(f"Failed to read uploaded file: {e}")
+            st.error(f"Failed to read upload: {e}")
             st.stop()
     else:
-        st.info("No combined file found — please upload or place combined_fixed.xlsx in /mnt/data")
+        st.info("Please upload combined_fixed.xlsx or place it in /mnt/data.")
         st.stop()
+else:
+    st.sidebar.success("Loaded combined_fixed.xlsx")
 
-# normalize columns & index
+# Normalize columns and index
 df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
-date_col = next((c for c in df.columns if 'date' in c or 'time' in c), None)
-if date_col is None:
-    st.error("No date/time column found in dataset.")
+try:
+    df = ensure_datetime_index(df)
+except Exception as e:
+    st.error(f"Date parsing error: {e}")
     st.stop()
 
-df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
-df.set_index(date_col, inplace=True)
+# detect OHLC and price column
+available_price_cols = [c for c in ['open','high','low','close'] if c in df.columns]
+if not available_price_cols:
+    # try to find numeric column fallback
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if not num_cols:
+        st.error("No OHLC or numeric columns found in dataset.")
+        st.stop()
+    price_col = st.sidebar.selectbox("Price column (fallback)", num_cols)
+else:
+    price_col = st.sidebar.selectbox("Price column", available_price_cols, index=available_price_cols.index('close') if 'close' in available_price_cols else 0)
 
-# sidebar filters
-st.sidebar.header("Filters")
+# instrument filter
 instruments = ["All"] + (sorted(df['source_file'].unique()) if 'source_file' in df.columns else [])
 instr = st.sidebar.selectbox("Instrument", instruments)
 if instr != "All":
-    df_plot = df[df['source_file'] == instr].copy()
+    df_sel = df[df['source_file'] == instr].copy()
 else:
-    df_plot = df.copy()
+    df_sel = df.copy()
 
-price_choices = [c for c in df_plot.columns if c in ['open','high','low','close']]
-if not price_choices:
-    st.error("No OHLC columns found.")
-    st.stop()
+# date filter
+start = st.sidebar.date_input("Start date", df_sel.index.min().date())
+end = st.sidebar.date_input("End date", df_sel.index.max().date())
+df_sel = df_sel.loc[str(start):str(end)]
 
-price_col = st.sidebar.selectbox("Price column for analysis", price_choices, index=price_choices.index('close') if 'close' in price_choices else 0)
-# date range
-start_date = st.sidebar.date_input("Start date", df_plot.index.min().date())
-end_date = st.sidebar.date_input("End date", df_plot.index.max().date())
-df_plot = df_plot.loc[start_date:end_date]
+st.markdown(f"### Selected instrument: **{instr}**; Price column: **{price_col}**; Rows: **{len(df_sel)}**")
 
-# ensure numeric price column
-price_ser = ensure_price_col(df_plot, price_col)
-df_plot[price_col] = price_ser
+# compute derived series
+df_calc = df_sel.copy()
+# cast OHLC numeric
+for c in ['open','high','low','close']:
+    if c in df_calc.columns:
+        df_calc[c] = safe_numeric(df_calc[c])
+# compute returns
+df_calc['ret'] = df_calc[price_col].pct_change()
+# ATR
+df_calc['tr'] = compute_true_range(df_calc, 'high','low','close') if {'high','low','close'}.issubset(df_calc.columns) else np.nan
+df_calc['atr_14'] = compute_atr(df_calc, window=14, high_col='high', low_col='low', close_col='close') if {'high','low','close'}.issubset(df_calc.columns) else np.nan
+# rolling vol
+df_calc['roll_vol_20'] = rolling_volatility(df_calc[price_col], window=20)
 
-# price plot
-st.subheader("Price Series")
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot[price_col], mode='lines', name=price_col))
-fig.update_layout(height=350)
-st.plotly_chart(fig, use_container_width=True)
+# Panels layout
+p1, p2 = st.columns([1,1])
 
-# returns and stats
-returns = df_plot[price_col].pct_change().dropna()
-st.subheader("Basic Statistics")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Observations", f"{len(returns)}")
-col2.metric("Mean Return", f"{returns.mean():.6f}")
-col3.metric("Std Return", f"{returns.std():.6f}")
-col4.metric("Shannon Entropy", f"{compute_shannon_entropy(returns):.6f}")
+with p1:
+    st.subheader("Price & Volatility")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_calc.index, y=df_calc[price_col], name='price', line=dict(color='lightblue')))
+    # overlay rolling volatility scaled for visual (secondary y)
+    fig.add_trace(go.Scatter(x=df_calc.index, y=df_calc['roll_vol_20'], name='roll_vol_20', yaxis='y2', line=dict(color='orange')))
+    fig.update_layout(height=350, legend=dict(orientation='h'), yaxis=dict(title='Price'), yaxis2=dict(title='Rolling Vol', overlaying='y', side='right'))
+    st.plotly_chart(fig, use_container_width=True)
 
-# ADF
-st.subheader("ADF Test")
-adf_res = adf_test(df_plot[price_col])
-st.write(adf_res)
-
-# ACF/PACF
-st.subheader("ACF / PACF")
-if HAS_STATSMODELS:
-    try:
-        acf_vals = acf(pd.to_numeric(df_plot[price_col], errors='coerce').dropna(), nlags=40)
-        pacf_vals = pacf(pd.to_numeric(df_plot[price_col], errors='coerce').dropna(), nlags=40)
-        fig_acf = go.Figure(); fig_acf.add_trace(go.Bar(x=list(range(len(acf_vals))), y=acf_vals)); fig_acf.update_layout(title='ACF')
-        fig_pacf = go.Figure(); fig_pacf.add_trace(go.Bar(x=list(range(len(pacf_vals))), y=pacf_vals)); fig_pacf.update_layout(title='PACF')
-        st.plotly_chart(fig_acf, use_container_width=True)
-        st.plotly_chart(fig_pacf, use_container_width=True)
-    except Exception as e:
-        st.warning(f"ACF/PACF failed: {e}")
-else:
-    st.warning("statsmodels not installed — ACF/PACF disabled")
-
-# Hurst
-st.metric("Hurst exponent (approx)", hurst_exponent(df_plot[price_col]) if 'hurst_exponent' in globals() else "N/A")
-
-# PCA on returns
-st.subheader("PCA on Returns")
-if HAS_SKLEARN:
-    try:
-        pca_res = run_pca_on_returns(df_plot, price_choices, n_components=min(5, len(price_choices)))
-        if isinstance(pca_res, dict):
-            ev = pca_res['explained_variance']
-            st.write("Explained variance ratio:", np.round(ev,4))
-            figp = go.Figure(); figp.add_trace(go.Bar(x=[f"PC{i+1}" for i in range(len(ev))], y=ev))
-            st.plotly_chart(figp, use_container_width=True)
-    except Exception as e:
-        st.warning(f"PCA failed: {e}")
-else:
-    st.warning("sklearn not installed — PCA disabled")
-
-# PCA-vol clusters
-st.subheader("PCA-Vol Clusters")
-if HAS_SKLEARN:
-    try:
-        labels, feat = pca_volatility_clusters(df_plot, price_col, n_clusters=3)
-        if labels is not None:
-            st.dataframe(feat.tail(10))
-            st.write("Cluster counts:", labels.value_counts())
-            df_plot['vol_cluster'] = labels
-    except Exception as e:
-        st.warning(f"PCA-vol clustering failed: {e}")
-else:
-    st.warning("sklearn not installed — Vol clustering disabled")
-
-# Regime clustering & transition matrix
-st.subheader("Regime Clustering")
-if HAS_SKLEARN:
-    try:
-        ret = df_plot[price_col].pct_change().fillna(0)
-        feat = pd.DataFrame({'mean': ret.rolling(20).mean().fillna(0), 'vol': ret.rolling(20).std().fillna(0)})
-        feat = feat.dropna()
-        if len(feat) > 10:
-            scaler = StandardScaler(); Xs = scaler.fit_transform(feat)
-            try:
-                gmm = GaussianMixture(n_components=2, random_state=0).fit(Xs)
-                labels = gmm.predict(Xs)
-            except Exception:
-                km = KMeans(n_clusters=2, random_state=0).fit(Xs)
-                labels = km.labels_
-            regimes = pd.Series(labels, index=feat.index)
-            regimes_full = pd.Series(np.nan, index=df_plot.index)
-            regimes_full.loc[regimes.index] = regimes
-            df_plot['regime'] = regimes_full
-            st.write("Regime counts:", regimes_full.value_counts(dropna=True))
-            trans = regime_transition_matrix(regimes_full)
-            if trans is not None:
-                st.subheader("Transition Matrix")
-                st.dataframe(trans)
-    except Exception as e:
-        st.warning(f"Regime clustering failed: {e}")
-else:
-    st.warning("sklearn not installed — regime clustering disabled")
-
-# GARCH
-st.subheader("GARCH (1,1)")
-if HAS_ARCH:
-    if len(returns) < 50:
-        st.info("Not enough data for GARCH (<50).")
+with p2:
+    st.subheader("Rolling ATR & Range")
+    if 'atr_14' in df_calc.columns and df_calc['atr_14'].notna().sum()>0:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df_calc.index, y=df_calc['atr_14'], name='ATR(14)', line=dict(color='magenta')))
+        fig2.add_trace(go.Scatter(x=df_calc.index, y=(df_calc['high']-df_calc['low']), name='Range', line=dict(color='lightgreen')))
+        fig2.update_layout(height=350)
+        st.plotly_chart(fig2, use_container_width=True)
     else:
-        try:
-            cond_vol, garch_res = run_garch(returns)
-            if cond_vol is not None:
-                # align cond_vol with df_plot index
-                cond_vol_full = cond_vol.reindex(df_plot.index).fillna(method='ffill')
-                st.line_chart(cond_vol_full)
-                st.text(garch_res.summary().as_text())
-        except Exception as e:
-            st.warning(f"GARCH failed: {e}")
-else:
-    st.warning("arch not installed — GARCH disabled")
+        st.info("ATR not available: OHLC columns missing.")
 
-# VAR forecasting
-st.subheader("VAR Forecast")
-var_cols = st.multiselect("Select columns for VAR (use OHLC)", price_choices, default=[price_col])
-steps = st.sidebar.number_input("Forecast steps", min_value=1, max_value=60, value=10)
-if HAS_STATSMODELS and var_cols:
-    try:
-        fc_df, var_res = var_fit_and_forecast(df_plot, var_cols, steps=int(steps))
-        if fc_df is not None:
-            st.dataframe(fc_df)
-            st.line_chart(fc_df)
-    except Exception as e:
-        st.warning(f"VAR failed: {e}")
+# Volatility Heatmap (resample daily or hourly)
+st.subheader("Volatility Heatmap (resampled)")
+heat_freq = st.selectbox("Heatmap frequency", ['D','W','H'], index=0, help="D=daily, W=weekly, H=hourly (if data intraday)")
+vseries = df_calc[price_col].pct_change()
+if vseries.dropna().empty:
+    st.warning("No valid returns to compute heatmap.")
 else:
-    st.warning("statsmodels not installed or no columns selected — VAR disabled")
-
-# Auto-ARIMA forecast
-st.subheader("Auto ARIMA Forecast (single series)")
-if HAS_PMDARIMA:
+    # compute volatility per period: std of returns inside each period
     try:
-        s = df_plot[price_col].pct_change().dropna()
-        if len(s) >= 30:
-            arima_fc, arima_model = auto_arima_forecast(s, steps=int(steps))
-            if arima_fc is not None:
-                st.line_chart(arima_fc)
-                st.write("Auto-ARIMA done.")
+        vol_by_period = vseries.groupby(pd.Grouper(freq=heat_freq)).std().rename('vol')
+        # pivot by month vs day-of-month for daily; for weekly/h hourly different layouts
+        if heat_freq == 'D':
+            heat_df = vol_by_period.to_frame().assign(month=vol_by_period.index.month, day=vol_by_period.index.day)
+            pivot = heat_df.pivot_table(index='day', columns='month', values='vol', aggfunc='mean')
+            fig_h = px.imshow(pivot, labels=dict(x="Month", y="Day", color="Vol"), aspect="auto")
+            st.plotly_chart(fig_h, use_container_width=True)
         else:
-            st.info("Need >=30 points for auto-ARIMA.")
+            # simple time-series coloured heatmap: split into weeks
+            heat_df = vol_by_period.reset_index()
+            heat_df['period_index'] = range(len(heat_df))
+            fig_lin = px.imshow([heat_df['vol'].fillna(0).values], labels=dict(x='Period', y='Vol'), aspect='auto')
+            st.plotly_chart(fig_lin, use_container_width=True)
     except Exception as e:
-        st.warning(f"Auto-ARIMA failed: {e}")
+        st.warning(f"Heatmap generation failed: {e}")
+
+# Range clustering
+st.subheader("Range Clustering (kmeans on range, ATR, rolling vol)")
+k_clusters = st.sidebar.slider("Range clusters (k)", 2, 6, 3)
+labels, feat = range_clustering(df_calc, price_cols=('open','high','low','close'), rolling_window=20, n_clusters=k_clusters)
+if labels is None:
+    st.warning("Range clustering unavailable (missing sklearn or insufficient data).")
 else:
-    st.warning("pmdarima not installed — auto-ARIMA disabled")
+    df_calc['range_cluster'] = labels
+    st.markdown("Cluster counts:")
+    st.write(labels.value_counts())
+    # show clusters over time
+    figc = go.Figure()
+    for lab in sorted(labels.unique()):
+        seg = df_calc[df_calc['range_cluster']==lab]
+        figc.add_trace(go.Scatter(x=seg.index, y=seg[price_col], mode='markers', name=f'cluster {lab}', marker=dict(size=4)))
+    figc.update_layout(height=300)
+    st.plotly_chart(figc, use_container_width=True)
+    # show feature scatter
+    if not feat.empty:
+        fig_sc = px.scatter(feat.reset_index(), x='range', y='atr_14', color=labels.loc[feat.index].astype(str), title='Range vs ATR colored by cluster')
+        st.plotly_chart(fig_sc, use_container_width=True)
 
-# Rolling entropy
-st.subheader("Rolling Entropy (window=60)")
-try:
-    roll_entropy = df_plot[price_col].pct_change().rolling(60).apply(lambda x: compute_shannon_entropy(pd.Series(x.dropna())), raw=False)
-    st.line_chart(roll_entropy)
-except Exception as e:
-    st.warning(f"Entropy computation failed: {e}")
+# Volatility regime classifier
+st.subheader("Volatility Regime Classifier (GMM/KMeans on rolling vol+returns)")
+n_regimes = st.sidebar.slider("Regimes", 2, 4, 2)
+regimes, feat_reg, trans = volatility_regime_classifier(df_calc, price_col=price_col, vol_window=20, n_regimes=n_regimes)
+if regimes is None:
+    st.warning("Volatility regime classification disabled (missing sklearn or insufficient data).")
+else:
+    df_calc['vol_regime'] = regimes
+    st.write("Regime counts:")
+    st.write(regimes.value_counts())
+    st.write("Transition matrix (rows = from-state):")
+    st.dataframe(trans)
+    # plot regimes on price
+    figr = go.Figure()
+    for r in sorted(regimes.dropna().unique()):
+        seg = df_calc[df_calc['vol_regime']==r]
+        figr.add_trace(go.Scatter(x=seg.index, y=seg[price_col], mode='lines', name=f'Regime {r}'))
+    figr.update_layout(height=350)
+    st.plotly_chart(figr, use_container_width=True)
+    # show volatility marching across regimes
+    st.line_chart(df_calc[['roll_vol_20']].assign(regime=df_calc['vol_regime'].fillna(-1)))
 
-# PDF export
-st.subheader("Export PDF report")
-if st.button("Generate PDF"):
-    if not HAS_REPORTLAB:
-        st.error("reportlab not installed - PDF export disabled")
+# Dynamic Range Compression Detector
+st.subheader("Dynamic Range Compression Detector (low ATR percentile detection)")
+percentile_thr = st.sidebar.slider("ATR compression percentile threshold", 1, 50, 10)
+if 'atr_14' in df_calc.columns and df_calc['atr_14'].notna().any():
+    df_calc['compressed'] = dynamic_range_compression(df_calc, atr_col='atr_14', window=14, percentile=percentile_thr)
+    st.write(f"Compression count: {df_calc['compressed'].sum()} points (ATR < {percentile_thr}th pct)")
+    # Show compression periods on price chart
+    comp_idx = df_calc.index[df_calc['compressed']]
+    fig_comp = go.Figure()
+    fig_comp.add_trace(go.Scatter(x=df_calc.index, y=df_calc[price_col], mode='lines', name='price'))
+    if not comp_idx.empty:
+        fig_comp.add_trace(go.Scatter(x=comp_idx, y=df_calc.loc[comp_idx, price_col], mode='markers', name='compressed', marker=dict(color='red', size=6)))
+    fig_comp.update_layout(height=300)
+    st.plotly_chart(fig_comp, use_container_width=True)
+    # show table of compression windows (group contiguous)
+    comp = df_calc['compressed'].astype(int)
+    groups = (comp.diff(1) != 0).cumsum()
+    comp_periods = []
+    in_period = False
+    start_i = None
+    for idx, v in df_calc['compressed'].iteritems():
+        if v and not in_period:
+            in_period = True
+            start_i = idx
+        if not v and in_period:
+            in_period = False
+            end_i = prev_idx
+            comp_periods.append((start_i, end_i))
+        prev_idx = idx
+    # if ended with compression
+    if in_period:
+        comp_periods.append((start_i, prev_idx))
+    if comp_periods:
+        comp_df = pd.DataFrame(comp_periods, columns=['start','end'])
+        st.write("Compression intervals (start - end):")
+        st.dataframe(comp_df)
     else:
-        summary_text = f"Dataset rows: {len(df_plot)}; Price column: {price_col}; Date range: {df_plot.index.min()} to {df_plot.index.max()}."
-        tables = {"Basic stats": pd.DataFrame({'mean_return':[returns.mean()], 'std_return':[returns.std()]})}
-        try:
-            pdf_path = generate_pdf_report(summary_text, tables)
-            with open(pdf_path, "rb") as f:
-                st.download_button("Download PDF", f, file_name="research_report_professional.pdf", mime="application/pdf")
-        except Exception as e:
-            st.error(f"PDF generation failed: {e}")
+        st.write("No continuous compression intervals detected.")
 
-st.success("App loaded (professional build).")
+else:
+    st.info("ATR not computed; compression detector not available.")
+
+# Trading-style regime classifier
+st.subheader("Trading-style Regime Classifier (combine vol regime & momentum)")
+mom_w = st.sidebar.slider("Momentum window", 1, 21, 5)
+if regimes is None:
+    tclass, df_m = trading_regime_classifier(df_calc, price_col=price_col, vol_regimes=None, momentum_window=mom_w)
+    st.warning("Volatility regimes not available; using momentum-only trading classifier.")
+    df_calc['trading_regime'] = tclass
+else:
+    tclass, df_m = trading_regime_classifier(df_calc, price_col=price_col, vol_regimes=regimes, momentum_window=mom_w)
+    df_calc['trading_regime'] = tclass
+    st.write("Trading regime snapshot (value = regime*10 + momentum sign): e.g., 10 = regime 1 & positive momentum")
+    st.dataframe(df_calc[['trading_regime']].dropna().tail(20))
+
+# Provide downloads: CSVs and cluster labels
+st.subheader("Download analysis artifacts")
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+    z.writestr('df_calc_sample.csv', df_calc.head(1000).to_csv(index=True))
+    if 'range_cluster' in df_calc.columns:
+        z.writestr('range_clusters.csv', df_calc[['range_cluster']].dropna().to_csv())
+    if 'vol_regime' in df_calc.columns:
+        z.writestr('vol_regimes.csv', df_calc[['vol_regime']].dropna().to_csv())
+    if 'trading_regime' in df_calc.columns:
+        z.writestr('trading_regimes.csv', df_calc[['trading_regime']].dropna().to_csv())
+buf.seek(0)
+st.download_button("Download artifacts ZIP", buf, file_name="range_vol_analysis_artifacts.zip", mime="application/zip")
+
+# Short explanation section
+st.markdown("---")
+st.subheader("How to interpret these outputs (quick guide)")
+st.markdown("""
+- **Volatility Heatmap**: shows how volatility clusters across calendar bins (daily/weekly/hourly). Bright cells = higher volatility.  
+- **Rolling ATR**: average true range — a measure of how wide each bar is on average. Low ATR = compression.  
+- **Range Clustering**: clusters periods by (range, ATR, rolling vol). Useful to label 'quiet', 'normal', 'explosive' periods.  
+- **Volatility Regimes**: unsupervised regimes (GMM/KMeans) on rolling vol + returns; transition matrix shows how regimes persist or switch.  
+- **Dynamic Range Compression Detector**: flags bars where ATR is below the chosen percentile — potential breakout setup when compression precedes expansion.  
+- **Trading-style Regime Classifier**: combines volatility regime and short-term momentum to create practical signals (e.g., low-vol + positive momentum -> trend continuation).  
+""")
+
+st.info("All algorithms fall back gracefully if sklearn/arch/statsmodels are missing. Let me know if you want more refinements (EGARCH, regime duration statistics, breakout strategy backtest).")
