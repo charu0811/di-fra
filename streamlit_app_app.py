@@ -6,7 +6,7 @@ import glob, io, zipfile
 from datetime import datetime
 
 # -------------------------------------------------
-# Optional imports (skip gracefully if unavailable)
+# Optional libraries
 # -------------------------------------------------
 try:
     from statsmodels.tsa.stattools import adfuller, acf, pacf
@@ -21,7 +21,8 @@ try:
 except:
     HAS_SKLEARN = False
 
-st.set_page_config(layout="wide", page_title="OHLC Research Dashboard")
+
+st.set_page_config(layout="wide", page_title="OHLC Research Dashboard (Final)")
 
 
 # -------------------------------------------------
@@ -32,7 +33,7 @@ def try_load_default():
     preferred = "/mnt/data/combined_multisheet_fixed_6dp_v2.xlsx"
 
     try:
-        df = pd.read_excel(preferred, sheet_name="Combined", engine="openpyxl")
+        df = pd.read_excel(preferred, sheet_name="Combined")
         return df, preferred
     except:
         pass
@@ -54,7 +55,7 @@ def try_load_default():
         except:
             pass
 
-    raise FileNotFoundError("No usable input file found in /mnt/data.")
+    raise FileNotFoundError("No usable Excel or CSV found in /mnt/data.")
 
 
 def load_uploaded(uploaded):
@@ -69,78 +70,76 @@ def load_uploaded(uploaded):
 
 
 # -------------------------------------------------
-# Safe Numeric Conversion
+# SAFE NUMERIC SERIES EXTRACTION
 # -------------------------------------------------
 def get_price_series(df, col):
     ser = pd.to_numeric(df[col], errors="coerce")
 
     if ser.dropna().size > 0:
-        if ser.isna().any():
-            st.warning(f"Column '{col}' contains non-numeric rows; ignoring them.")
         return ser
 
-    # If this column is datetime-like → not usable
+    # If datetime/string column
     try:
-        parsed = pd.to_datetime(df[col], errors="ignore")
+        parsed = pd.to_datetime(df[col], errors="coerce")
         if parsed.notna().sum() > 0:
             if "close" in df.columns:
-                st.info(f"'{col}' seems like a date/time column → using 'close'.")
+                st.info(f"Column '{col}' is date-like — switching to 'close'.")
                 return pd.to_numeric(df["close"], errors="coerce")
-            st.error("Column is not numeric. Pick a numeric price column.")
-            st.stop()
+            else:
+                st.error("Chosen column is non-numeric. Select proper OHLC column.")
+                st.stop()
     except:
         pass
 
-    # Find fallback numeric-like column
+    # Fallback search
     numeric_candidates = [
         c for c in df.columns
         if pd.to_numeric(df[c], errors="coerce").dropna().size > 0
     ]
-
     if numeric_candidates:
         fallback = numeric_candidates[0]
-        st.warning(f"Falling back to numeric column '{fallback}'.")
+        st.warning(f"Fallback: using '{fallback}' instead of '{col}'.")
         return pd.to_numeric(df[fallback], errors="coerce")
 
-    st.error("No numeric columns found in dataset.")
+    st.error("No numeric columns found.")
     st.stop()
 
 
 # -------------------------------------------------
-# SAFE ADF TEST (crash-proof)
+# SAFE ADF FUNCTION
 # -------------------------------------------------
 def adf_test(series):
     if not HAS_STATSMODELS:
         return "statsmodels not installed"
 
-    ser = series.dropna()
-    if len(ser) < 10:
+    s = series.dropna()
+    if len(s) < 10:
         return "Not enough data"
 
-    if ser.nunique() <= 1:
-        return "ADF not applicable: series is constant"
+    if s.nunique() <= 1:
+        return "ADF not applicable: constant series"
 
     try:
-        result = adfuller(ser)
+        res = adfuller(s)
         return {
-            "adf_stat": result[0],
-            "p_value": result[1],
-            "used_lags": result[2],
-            "n_obs": result[3],
-            "critical_values": result[4]
+            "adf_stat": res[0],
+            "p_value": res[1],
+            "lags": res[2],
+            "n_obs": res[3],
+            "critical_values": res[4]
         }
     except Exception as e:
         return f"ADF error: {str(e)}"
 
 
 # -------------------------------------------------
-# ACF & PACF
+# ACF, PACF
 # -------------------------------------------------
 def plot_acf_pacf(series):
     if not HAS_STATSMODELS:
-        fig1 = go.Figure(); fig1.update_layout(title="ACF (statsmodels missing)")
-        fig2 = go.Figure(); fig2.update_layout(title="PACF (statsmodels missing)")
-        return fig1, fig2
+        empty = go.Figure()
+        empty.update_layout(title="ACF/PACF unavailable (statsmodels missing)")
+        return empty, empty
 
     s = series.dropna()
     acf_vals = acf(s, nlags=40)
@@ -158,15 +157,14 @@ def plot_acf_pacf(series):
 
 
 # -------------------------------------------------
-# Hurst Exponent
+# HURST EXPONENT
 # -------------------------------------------------
 def hurst_exponent(series):
-    import numpy as np
     import scipy.stats as stats
 
     x = np.array(series.dropna())
-    N = len(x)
-    if N < 50: return np.nan
+    if len(x) < 50:
+        return np.nan
 
     lags = np.arange(2, 20)
     tau = [np.sqrt(np.std(x[lag:] - x[:-lag])) for lag in lags]
@@ -175,17 +173,21 @@ def hurst_exponent(series):
 
 
 # -------------------------------------------------
-# Regime Clustering
+# REGIME CLUSTERING
 # -------------------------------------------------
-def regime_clustering(df, price_col="close", window=20):
+def regime_clustering(df, price_col="close"):
     if not HAS_SKLEARN:
         return pd.Series([np.nan] * len(df)), pd.DataFrame()
 
-    ret = df[price_col].pct_change().fillna(0)
-    rmean = ret.rolling(window).mean().fillna(0)
-    rvol = ret.rolling(window).std().fillna(0)
+    ret = pd.to_numeric(df[price_col], errors="coerce").pct_change().fillna(0)
+    rmean = ret.rolling(20).mean().fillna(0)
+    rvol = ret.rolling(20).std().fillna(0)
 
     X = pd.DataFrame({"mean": rmean, "vol": rvol}).dropna()
+
+    if len(X) < 10:
+        return pd.Series([np.nan] * len(df)), X
+
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
 
@@ -197,34 +199,34 @@ def regime_clustering(df, price_col="close", window=20):
 
 
 # -------------------------------------------------
-# Coefficient of Variation Report
+# COV REPORT
 # -------------------------------------------------
 def compute_cov(df):
     df = df.copy()
     df["ret"] = df["close"].pct_change()
-    ret = df["ret"].dropna()
+    r = df["ret"].dropna()
 
     summary = {
-        "mean_return": ret.mean(),
-        "std_return": ret.std(),
-        "cov": ret.std() / abs(ret.mean()) if ret.mean() != 0 else np.nan
+        "mean_return": r.mean(),
+        "std_return": r.std(),
+        "cov": r.std() / abs(r.mean()) if r.mean() != 0 else np.nan,
     }
 
     corr = df[["open", "high", "low", "close"]].corr()
 
     per_inst = None
     if "source_file" in df.columns:
-        rows = []
+        arr = []
         for name, g in df.groupby("source_file"):
-            r = g["close"].pct_change().dropna()
-            if len(r) > 0:
-                rows.append({
+            rr = g["close"].pct_change().dropna()
+            if len(rr) > 0:
+                arr.append({
                     "instrument": name,
-                    "mean": r.mean(),
-                    "std": r.std(),
-                    "cov": r.std() / abs(r.mean()) if r.mean() != 0 else np.nan
+                    "mean": rr.mean(),
+                    "std": rr.std(),
+                    "cov": rr.std() / abs(rr.mean()) if rr.mean() != 0 else np.nan,
                 })
-        per_inst = pd.DataFrame(rows)
+        per_inst = pd.DataFrame(arr)
 
     return summary, corr, per_inst
 
@@ -236,7 +238,7 @@ def zip_report(summary, corr, per_inst):
         z.writestr("correlation.csv", corr.to_csv())
         if per_inst is not None:
             z.writestr("cov_per_instrument.csv", per_inst.to_csv(index=False))
-        z.writestr("README.txt", "CoV report generated automatically.")
+        z.writestr("README.txt", "Auto-generated CoV Report")
     mem.seek(0)
     return mem
 
@@ -244,63 +246,73 @@ def zip_report(summary, corr, per_inst):
 # -------------------------------------------------
 # UI START
 # -------------------------------------------------
-st.title("OHLC Research Dashboard — Updated & Stable")
+st.title("OHLC Research Dashboard — Final Stable Version")
 
 # Load data
 try:
     df, path = try_load_default()
     st.sidebar.success(f"Loaded: {path}")
 except:
-    uploaded = st.sidebar.file_uploader("Upload Excel/CSV")
+    uploaded = st.sidebar.file_uploader("Upload Combined Excel/CSV")
     if uploaded:
         df = load_uploaded(uploaded)
-        st.sidebar.success(f"Loaded {uploaded.name}")
+        st.sidebar.success("Loaded uploaded file")
     else:
         st.stop()
 
 # Normalize
 df.columns = [c.lower().replace(" ", "_") for c in df.columns]
 
-# Find date column
+# find date column
 date_col = next((c for c in df.columns if "date" in c or "time" in c), None)
 if date_col is None:
-    st.error("No date column found.")
+    st.error("No date column detected.")
     st.stop()
 
 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-df = df.dropna(subset=[date_col]).sort_values(by=date_col)
+df = df.dropna(subset=[date_col])
 
-# -------------------------------
-# Sidebar Filters
-# -------------------------------
+
+# -------------------------------------------------
+# SIDEBAR
+# -------------------------------------------------
 instruments = ["All"] + sorted(df["source_file"].unique()) if "source_file" in df.columns else ["All"]
-selected_inst = st.sidebar.selectbox("Instrument", instruments)
+inst = st.sidebar.selectbox("Instrument", instruments)
 
-value_col = st.sidebar.selectbox("Price Column", ["open", "high", "low", "close"])
+price_col = st.sidebar.selectbox("Price Column", ["open", "high", "low", "close"])
 
-start = st.sidebar.date_input("Start Date", df[date_col].min())
-end = st.sidebar.date_input("End Date", df[date_col].max())
+start = st.sidebar.date_input("Start", df[date_col].min())
+end = st.sidebar.date_input("End", df[date_col].max())
 
-# Apply filters
+# Filtering
 data = df.copy()
-if selected_inst != "All":
-    data = data[data["source_file"] == selected_inst]
+if inst != "All":
+    data = data[data["source_file"] == inst]
 
 data = data[(data[date_col] >= pd.Timestamp(start)) & (data[date_col] <= pd.Timestamp(end))]
 
+# -------------------------------------
 # SAFE PRICE
-price = get_price_series(data, value_col)
+# -------------------------------------
+price = get_price_series(data, price_col)
+
+# CRITICAL FIX:
+data[price_col] = price  # ensure numeric for clustering
+
 data["ret"] = price.pct_change()
-data["logret"] = np.log(price).diff()
+data["logret"] = np.log(price.replace(0, np.nan)).diff()
+
 
 # -------------------------------------------------
 # METRICS
 # -------------------------------------------------
 adf_price = adf_test(price)
-adf_returns = adf_test(data["ret"])
+adf_ret = adf_test(data["ret"])
+
 acf_fig, pacf_fig = plot_acf_pacf(price)
 hurst = hurst_exponent(price)
-regimes, feats = regime_clustering(data, price_col=value_col)
+regimes, feats = regime_clustering(data, price_col=price_col)
+
 
 # -------------------------------------------------
 # KPIs
@@ -308,10 +320,11 @@ regimes, feats = regime_clustering(data, price_col=value_col)
 c1, c2, c3 = st.columns(3)
 c1.metric("Start", str(start))
 c2.metric("End", str(end))
-c3.metric("Mean Price", f"{price.mean():.6f}")
+c3.metric(f"Mean {price_col}", f"{price.mean():.6f}")
+
 
 # -------------------------------------------------
-# PRICE + REGIME PLOT
+# PLOT PRICE + REGIMES
 # -------------------------------------------------
 fig = go.Figure()
 
@@ -319,35 +332,36 @@ if regimes.notna().sum() > 0:
     for r in regimes.unique():
         seg = data.iloc[regimes[regimes == r].index]
         fig.add_trace(go.Scatter(
-            x=seg[date_col], y=seg[value_col],
+            x=seg[date_col], y=seg[price_col],
             mode="lines", name=f"Regime {r}"
         ))
 else:
     fig.add_trace(go.Scatter(
-        x=data[date_col], y=data[value_col],
-        mode="lines", name=value_col
+        x=data[date_col], y=data[price_col],
+        mode="lines", name=price_col
     ))
 
-fig.update_layout(title="Regime Clustering", height=450)
+fig.update_layout(title="Price with Regime Segmentation", height=450)
 st.plotly_chart(fig, use_container_width=True)
+
 
 # -------------------------------------------------
 # STATIONARITY
 # -------------------------------------------------
-st.subheader("Stationarity Tests (ADF)")
+st.subheader("ADF Stationarity Analysis")
+st.write("Price:", adf_price)
+st.write("Returns:", adf_ret)
 
-st.write("Price ADF:", adf_price)
-st.write("Returns ADF:", adf_returns)
-
-col1, col2 = st.columns(2)
-col1.plotly_chart(acf_fig, use_container_width=True)
-col2.plotly_chart(pacf_fig, use_container_width=True)
+colA, colB = st.columns(2)
+colA.plotly_chart(acf_fig, use_container_width=True)
+colB.plotly_chart(pacf_fig, use_container_width=True)
 
 # -------------------------------------------------
 # HURST
 # -------------------------------------------------
 st.subheader("Hurst Exponent")
 st.write(f"H ≈ {hurst:.4f}")
+
 
 # -------------------------------------------------
 # REGIME FEATURES
@@ -356,20 +370,21 @@ st.subheader("Regime Features")
 if not feats.empty:
     st.dataframe(feats.join(regimes.rename("regime")).tail(200))
 
+
 # -------------------------------------------------
 # CoV REPORT
 # -------------------------------------------------
 st.header("Coefficient of Variation (CoV) Report")
 
-if st.button("Generate CoV Report ZIP"):
+if st.button("Generate CoV Report"):
     summary, corr, per_inst = compute_cov(data)
-    buf = zip_report(summary, corr, per_inst)
+    zip_buf = zip_report(summary, corr, per_inst)
 
-    st.success("Report Generated")
+    st.success("Report Ready")
 
     st.download_button(
         "Download CoV ZIP",
-        buf,
+        zip_buf,
         "cov_report.zip",
         mime="application/zip"
     )
