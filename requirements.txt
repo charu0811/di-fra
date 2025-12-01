@@ -4,11 +4,10 @@ numpy
 plotly
 openpyxl
 scikit-learn
-scipy
 statsmodels
 arch
-statsmodels
-sklearn
 pmdarima
-reportlab
+scipy
 matplotlib
+reportlab
+seaborn
